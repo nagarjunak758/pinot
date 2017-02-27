@@ -61,6 +61,7 @@ public class ServerQueryExecutorV1Impl implements QueryExecutor {
   private boolean _printQueryPlan = false;
   private final Map<String, Long> _resourceTimeOutMsMap = new ConcurrentHashMap<String, Long>();
   private ServerMetrics _serverMetrics;
+  private int _totalRawDocs = 0;
 
   public ServerQueryExecutorV1Impl() {
   }
@@ -132,31 +133,36 @@ public class ServerQueryExecutorV1Impl implements QueryExecutor {
       planExecTimer.stopAndRecord();
 
       dataTable = globalQueryPlan.getInstanceResponse();
+      Map<String, String> dataTableMetadata = dataTable.getMetadata();
       queryProcessingTimer.stopAndRecord();
 
       LOGGER.debug("Searching Instance for Request Id - {}, browse took: {}", instanceRequest.getRequestId(),
           queryProcessingTimer.getDurationNs());
       LOGGER.debug("InstanceResponse for Request Id - {} : {}", instanceRequest.getRequestId(), dataTable.toString());
-      dataTable.getMetadata()
+      dataTableMetadata
           .put(DataTable.TIME_USED_MS_METADATA_KEY, Long.toString(queryProcessingTimer.getDurationMs()));
-      dataTable.getMetadata().put(DataTable.REQUEST_ID_METADATA_KEY, Long.toString(instanceRequest.getRequestId()));
-      dataTable.getMetadata()
+      dataTableMetadata.put(DataTable.REQUEST_ID_METADATA_KEY, Long.toString(instanceRequest.getRequestId()));
+      dataTableMetadata
           .put(DataTable.TRACE_INFO_METADATA_KEY, TraceContext.getTraceInfoOfRequestId(instanceRequest.getRequestId()));
+
+      // Update the total docs in the metadata based on un-pruned segments.
+      dataTableMetadata.put(DataTable.TOTAL_DOCS_METADATA_KEY, String.valueOf(_totalRawDocs));
       return dataTable;
     } catch (Exception e) {
       _serverMetrics.addMeteredQueryValue(instanceRequest.getQuery(), ServerMeter.QUERY_EXECUTION_EXCEPTIONS, 1);
       LOGGER.error("Exception processing requestId {}", requestId, e);
       dataTable = new DataTableImplV2();
+      Map<String, String> dataTableMetadata = dataTable.getMetadata();
       dataTable.addException(QueryException.getException(QueryException.QUERY_EXECUTION_ERROR, e));
       TraceContext.logException("ServerQueryExecutorV1Impl", "Exception occurs in processQuery");
       queryProcessingTimer.stopAndRecord();
 
       LOGGER.info("Searching Instance for Request Id - {}, browse took: {}, instanceResponse: {}", requestId,
           queryProcessingTimer.getDurationMs(), dataTable.toString());
-      dataTable.getMetadata()
+      dataTableMetadata
           .put(DataTable.TIME_USED_MS_METADATA_KEY, Long.toString(queryProcessingTimer.getDurationNs()));
-      dataTable.getMetadata().put(DataTable.REQUEST_ID_METADATA_KEY, Long.toString(instanceRequest.getRequestId()));
-      dataTable.getMetadata()
+      dataTableMetadata.put(DataTable.REQUEST_ID_METADATA_KEY, Long.toString(instanceRequest.getRequestId()));
+      dataTableMetadata
           .put(DataTable.TRACE_INFO_METADATA_KEY, TraceContext.getTraceInfoOfRequestId(instanceRequest.getRequestId()));
       return dataTable;
     } finally {
@@ -182,10 +188,13 @@ public class ServerQueryExecutorV1Impl implements QueryExecutor {
         instanceRequest.getSearchSegments());
     LOGGER.debug("TableDataManager found {} segments before pruning", listOfQueryableSegments.size());
 
+    _totalRawDocs = 0; // Need to reset the total raw docs per query.
     Iterator<SegmentDataManager> it = listOfQueryableSegments.iterator();
     while (it.hasNext()) {
       SegmentDataManager segmentDataManager = it.next();
       final IndexSegment indexSegment = segmentDataManager.getSegment();
+      // We need to compute the total raw docs for the table before any pruning.
+      _totalRawDocs += indexSegment.getSegmentMetadata().getTotalRawDocs();
       if (_segmentPrunerService.prune(indexSegment, instanceRequest.getQuery())) {
         it.remove();
         tableDataManager.releaseSegment(segmentDataManager);
